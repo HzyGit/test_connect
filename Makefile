@@ -1,5 +1,5 @@
 CC:=g++
-
+CXXFLAGS:= -std=c++11 -g
 test_connect: test_connect.cpp
 
 clean:

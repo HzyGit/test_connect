@@ -10,10 +10,32 @@
 #include <string.h>
 #include <getopt.h>
 
+#include <list>
+#include <algorithm>
 
 const char *g_host="127.0.0.1";
 const char *g_serv="22";
 struct timeval g_timeout={3,0};
+
+/// @brief 探测结构
+struct connect_unit{
+	int sockfd;   ///< 套接字
+	struct sockaddr_storage addr;
+	socklen_t addrlen;
+	std::string host;
+	std::string serv;
+};
+
+std::list<connect_unit* > g_connect_list;
+
+/// @brief list<connect_unit*>探测结构的指针
+static void clean_connect_list(std::list<connect_unit*> &ls){
+	for(auto it=ls.begin();it!=ls.end();++it){
+		close((*it)->sockfd);
+		delete *it;
+	}
+	ls.clear();
+}
 
 /// @brief 以tv为超时值建立tcp链接
 /// @param[in] socketfd tcp套接字
@@ -70,37 +92,112 @@ static int connect_nonb(int sockfd,const struct sockaddr *addr,socklen_t salen,
 	return err;
 }
 
-/// @brief 依据Host，Serv，解析sockaddr地址
-/// @retval 成功返回相应套接字 错误返回错误代码负值
-static int create_socket(struct sockaddr *addr,socklen_t *addrlen,
-		const char *host,const char *serv){
-	if(NULL==host||NULL==serv||NULL==addr||NULL==addrlen)
+/// @brief 依据AI_NUMERIC解析host,serv为connect_unit结构，并添加至g_connect_list
+/// @retval 成功返回0，错误返回错误代码负值
+static int append_connect_list_numeric(const char *host,const char *serv){
+	if(NULL==host||serv==NULL)
 		return -EINVAL;
+	/// 解析host,serv
 	struct addrinfo hints,*info;
 	memset(&hints,0,sizeof(hints));
 	hints.ai_flags=AI_NUMERICHOST|AI_NUMERICSERV;
-	hints.ai_family=AF_UNSPEC;
 	hints.ai_socktype=SOCK_STREAM;
+	hints.ai_family=AF_UNSPEC;
 	int err=0;
-	err=getaddrinfo(host,serv,&hints,&info);
-	if(err){
+	if((err=getaddrinfo(host,serv,&hints,&info))!=0){
+		error_at_line(0,0,__FILE__,__LINE__,"getaddrinfo error:%s",gai_strerror(err));
+		return -EINVAL;
+	}
+	// 转换为connect_unit
+	struct addrinfo *old=info;
+	for(;info!=NULL;info=info->ai_next){
+		int sockfd=socket(info->ai_family,info->ai_socktype,info->ai_protocol);
+		if(sockfd<0){
+			error_at_line(0,errno,__FILE__,__LINE__,"create socket error");
+			continue;
+		}
+		struct connect_unit *unit=new connect_unit;
+		if(NULL==unit)
+			continue;
+		unit->sockfd=sockfd;
+		memcpy(&(unit->addr),info->ai_addr,info->ai_addrlen);
+		unit->addrlen=info->ai_addrlen;
+		unit->host=host;
+		unit->serv=serv;
+		g_connect_list.push_back(unit);
+	}
+	freeaddrinfo(old);
+	return 0;
+}
+
+/// @brief 转换sockaddr为字符串表示
+/// @retval 成功返回0 失败错误代码负值
+static int sockaddr_to_string(const struct sockaddr *addr,socklen_t len,
+		std::string &str_host,std::string &str_serv){
+	if(NULL==addr||0==len)
+		return -EINVAL;
+	char host[NI_MAXHOST],serv[NI_MAXSERV];
+	int err;
+	if((err=getnameinfo(addr,len,host,NI_MAXHOST,serv,NI_MAXSERV,NI_NUMERICHOST|NI_NUMERICSERV))!=0){
+		error_at_line(0,0,__FILE__,__LINE__,"getnameinfo error:",gai_strerror(err));
+		return -EINVAL;
+	}
+	str_host=host;
+	str_serv=serv;
+	return 0;
+}
+
+
+/// @brief 判断字符串是否为数字
+static bool is_numeric_str(const char *str){
+	if(NULL==str)
+		return false;
+	for(int i=0;str[i]!='\0';++i){
+		if(str[i]<'0'||str[i]>'9')
+			return false;
+	}
+	return true;
+}
+
+/// @brief 依据域名解析host,serv，并添加至g_connect_list
+/// @retval 0成功 <0 错误代码负值
+static int append_connect_list_domain(const char *host,const char *serv){
+	if(NULL==serv||NULL==host)
+		return -EINVAL;
+	/// 解析host,serv
+	struct addrinfo hints,*ainfo;
+	memset(&hints,0,sizeof(hints));
+	if(is_numeric_str(serv))
+		hints.ai_flags=AI_NUMERICSERV;
+	hints.ai_socktype=SOCK_DGRAM;
+	hints.ai_family=AF_UNSPEC;
+	int err=0;
+	if((err=getaddrinfo(host,serv,&hints,&ainfo))!=0){
 		error_at_line(0,0,__FILE__,__LINE__,"getaddrinfo error :%s",gai_strerror(err));
 		return -EINVAL;
 	}
-	/// 复制地址
-	if(info->ai_addrlen>*addrlen)
-		return -EFAULT;
-	*addrlen=info->ai_addrlen;
-	memcpy(addr,info->ai_addr,info->ai_addrlen);
-	/// 建立套接字
-	int sockfd=socket(info->ai_family,info->ai_socktype,info->ai_protocol);
-	freeaddrinfo(info);
-	if(sockfd<0){
-		error_at_line(0,errno,__FILE__,__LINE__,"sockeet error");
-		return -errno;
+	/// 解析connect_unit
+	struct addrinfo *old=ainfo;
+	for(;ainfo!=NULL;ainfo=ainfo->ai_next){
+		int sockfd=socket(ainfo->ai_family,ainfo->ai_socktype,ainfo->ai_protocol);
+		if(sockfd<0){
+			error_at_line(0,errno,__FILE__,__LINE__,"create socket error");
+			continue;
+		}
+		struct connect_unit *unit=new connect_unit;
+		unit->sockfd=sockfd;
+		memcpy(&(unit->addr),ainfo->ai_addr,ainfo->ai_addrlen);
+		unit->addrlen=ainfo->ai_addrlen;
+		if(sockaddr_to_string(ainfo->ai_addr,ainfo->ai_addrlen,unit->host,unit->serv)<0){
+			unit->host="unknown";
+			unit->serv="uknown";
+		}
+		g_connect_list.push_back(unit);
 	}
-	return sockfd;
+	freeaddrinfo(old);
+	return 0;
 }
+
 
 
 static void usage(int err){
@@ -158,22 +255,31 @@ static void parse_argument(int argc,char **argv){
 	}
 }
 
+/// @brief 设置g_connect_list
+static void init_connect_list(){
+	g_connect_list.clear();
+	if(append_connect_list_numeric(g_host,g_serv)<0)
+		append_connect_list_domain(g_host,g_serv);
+}
+
+/// @brief 测试单个连接
+static void test_connect_unit(const connect_unit *unit){
+	printf("connect %s:%s",unit->host.c_str(),unit->serv.c_str());
+	int err=connect_nonb(unit->sockfd,(struct sockaddr*)&(unit->addr),unit->addrlen,g_timeout);
+	if(err)
+		printf("  %s\n",strerror(-err));
+	else
+		printf("  ok\n");
+}
+
 int main(int argc,char **argv){
 	parse_argument(argc,argv);
-	/// 建立套接字
-	struct sockaddr_storage addr;
-	socklen_t addrlen=sizeof(addr);
-	int sockfd=create_socket((struct sockaddr*)&addr,&addrlen,g_host,g_serv);
-	if(sockfd<0)
-		error_at_line(EXIT_FAILURE,-sockfd,__FILE__,__LINE__,"create socket error");
+	/// 建立connect_list
+	init_connect_list();
 	/// 测试连接
-	int err=connect_nonb(sockfd,(struct sockaddr*)&addr,addrlen,g_timeout);
-	if(err<0){
-		close(sockfd);
-		error(EXIT_FAILURE,-err,"connect %s:%s error",g_host,g_serv);
-	}
-	printf("connect to %s:%s Ok\n",g_host,g_serv);
-	close(sockfd);
+	std::for_each(g_connect_list.begin(),g_connect_list.end(),test_connect_unit);
+	/// 释放connect_list
+	clean_connect_list(g_connect_list);
 	return 0;
 }
 
