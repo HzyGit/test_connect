@@ -8,10 +8,11 @@
 #include <sys/types.h>
 #include <netdb.h>
 #include <string.h>
+#include <getopt.h>
 
 
-const char *g_host=NULL;
-const char *g_serv=NULL;
+const char *g_host="127.0.0.1";
+const char *g_serv="22";
 struct timeval g_timeout={3,0};
 
 /// @brief 以tv为超时值建立tcp链接
@@ -101,13 +102,60 @@ static int create_socket(struct sockaddr *addr,socklen_t *addrlen,
 	return sockfd;
 }
 
+
+static void usage(int err){
+	const char *name=program_invocation_short_name;
+	if(err==EXIT_SUCCESS){
+		printf("Usage: %s [options] host prot\n",name);
+		printf("测试指定主机端口是否打开,主机默认为127.0.0.1,端口默认为22\n");
+		printf("\n");
+		printf("选项:\n");
+		printf("  -s, --sec  测试时的超时值，单位为秒,默认值为3\n");
+		printf("  -h, --help 显示改帮助信息\n");
+
+	}else{
+		printf("Please type \"%s --hep\" for more infomation\n",name);
+	}
+	exit(err);
+}
+
 /// @brief 解析命令行参数
 static void parse_argument(int argc,char **argv){
-	if(argc!=3){
-		error_at_line(EXIT_FAILURE,0,__FILE__,__LINE__,"argument error:");
+	const char *name=program_invocation_short_name;
+	struct option opts[]={
+		{"help",no_argument,NULL,'h'},
+		{"sec",required_argument,NULL,'s'},
+		{NULL,0,NULL,0},
+	};
+	int ch;
+	while((ch=getopt_long(argc,argv,":hs:",opts,NULL))!=-1){
+		long sec;
+		switch(ch){
+			case 'h':
+				usage(EXIT_SUCCESS);
+			case 's':
+				sec=strtol(optarg,NULL,10);
+				if(sec<=0){
+					fprintf(stderr,"%s: 超时值必须大于0\n",name);
+					usage(EXIT_FAILURE);
+				}
+				g_timeout.tv_sec=sec;
+				break;
+			case '?':
+				fprintf(stderr,"%s:未识别选项: \'%c\'\n",name,optopt);
+				usage(EXIT_FAILURE);
+			case ':':
+				fprintf(stderr,"%s:选项\'%c\'缺少参数\n",name,optopt);
+				usage(EXIT_FAILURE);
+			default:
+				fprintf(stderr,"%s:解析参数遇到未知错误\n",name);
+				usage(EXIT_FAILURE);
+		}
 	}
-	g_host=argv[1];
-	g_serv=argv[2];
+	if(argc-optind==2){
+		g_host=argv[optind];
+		g_serv=argv[optind+1];
+	}
 }
 
 int main(int argc,char **argv){
