@@ -6,6 +6,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/types.h>
+#include <sys/time.h>
+#include <sys/select.h>
 #include <netdb.h>
 #include <string.h>
 #include <getopt.h>
@@ -92,42 +94,15 @@ static int connect_nonb(int sockfd,const struct sockaddr *addr,socklen_t salen,
 	return err;
 }
 
-/// @brief 依据AI_NUMERIC解析host,serv为connect_unit结构，并添加至g_connect_list
-/// @retval 成功返回0，错误返回错误代码负值
-static int append_connect_list_numeric(const char *host,const char *serv){
-	if(NULL==host||serv==NULL)
-		return -EINVAL;
-	/// 解析host,serv
-	struct addrinfo hints,*info;
-	memset(&hints,0,sizeof(hints));
-	hints.ai_flags=AI_NUMERICHOST|AI_NUMERICSERV;
-	hints.ai_socktype=SOCK_STREAM;
-	hints.ai_family=AF_UNSPEC;
-	int err=0;
-	if((err=getaddrinfo(host,serv,&hints,&info))!=0){
-		error_at_line(0,0,__FILE__,__LINE__,"getaddrinfo error:%s",gai_strerror(err));
-		return -EINVAL;
+/// @brief 判断字符串是否为数字
+static bool is_numeric_str(const char *str){
+	if(NULL==str)
+		return false;
+	for(int i=0;str[i]!='\0';++i){
+		if(str[i]<'0'||str[i]>'9')
+			return false;
 	}
-	// 转换为connect_unit
-	struct addrinfo *old=info;
-	for(;info!=NULL;info=info->ai_next){
-		int sockfd=socket(info->ai_family,info->ai_socktype,info->ai_protocol);
-		if(sockfd<0){
-			error_at_line(0,errno,__FILE__,__LINE__,"create socket error");
-			continue;
-		}
-		struct connect_unit *unit=new connect_unit;
-		if(NULL==unit)
-			continue;
-		unit->sockfd=sockfd;
-		memcpy(&(unit->addr),info->ai_addr,info->ai_addrlen);
-		unit->addrlen=info->ai_addrlen;
-		unit->host=host;
-		unit->serv=serv;
-		g_connect_list.push_back(unit);
-	}
-	freeaddrinfo(old);
-	return 0;
+	return true;
 }
 
 /// @brief 转换sockaddr为字符串表示
@@ -147,17 +122,49 @@ static int sockaddr_to_string(const struct sockaddr *addr,socklen_t len,
 	return 0;
 }
 
-
-/// @brief 判断字符串是否为数字
-static bool is_numeric_str(const char *str){
-	if(NULL==str)
-		return false;
-	for(int i=0;str[i]!='\0';++i){
-		if(str[i]<'0'||str[i]>'9')
-			return false;
+/// @brief 依据AI_NUMERIC解析host,serv为connect_unit结构，并添加至g_connect_list
+/// @retval 成功返回0，错误返回错误代码负值
+static int append_connect_list_numeric(const char *host,const char *serv){
+	if(NULL==host||serv==NULL)
+		return -EINVAL;
+	/// 解析host,serv
+	struct addrinfo hints,*info;
+	memset(&hints,0,sizeof(hints));
+	hints.ai_flags=AI_NUMERICHOST;
+	if(is_numeric_str(serv))
+		hints.ai_flags|=AI_NUMERICSERV;
+	hints.ai_socktype=SOCK_STREAM;
+	hints.ai_family=AF_UNSPEC;
+	int err=0;
+	if((err=getaddrinfo(host,serv,&hints,&info))!=0){
+		//error_at_line(0,0,__FILE__,__LINE__,"getaddrinfo error:%s",gai_strerror(err));
+		return -EINVAL;
 	}
-	return true;
+	// 转换为connect_unit
+	struct addrinfo *old=info;
+	for(;info!=NULL;info=info->ai_next){
+		int sockfd=socket(info->ai_family,info->ai_socktype,info->ai_protocol);
+		if(sockfd<0){
+			error_at_line(0,errno,__FILE__,__LINE__,"create socket error");
+			continue;
+		}
+		struct connect_unit *unit=new connect_unit;
+		if(NULL==unit)
+			continue;
+		unit->sockfd=sockfd;
+		memcpy(&(unit->addr),info->ai_addr,info->ai_addrlen);
+		unit->addrlen=info->ai_addrlen;
+		if(sockaddr_to_string(info->ai_addr,info->ai_addrlen,unit->host,unit->serv)<0){
+			unit->host="unknown";
+			unit->serv="uknown";
+		}
+		g_connect_list.push_back(unit);
+	}
+	freeaddrinfo(old);
+	return 0;
 }
+
+
 
 /// @brief 依据域名解析host,serv，并添加至g_connect_list
 /// @retval 0成功 <0 错误代码负值
@@ -169,7 +176,7 @@ static int append_connect_list_domain(const char *host,const char *serv){
 	memset(&hints,0,sizeof(hints));
 	if(is_numeric_str(serv))
 		hints.ai_flags=AI_NUMERICSERV;
-	hints.ai_socktype=SOCK_DGRAM;
+	hints.ai_socktype=SOCK_STREAM;
 	hints.ai_family=AF_UNSPEC;
 	int err=0;
 	if((err=getaddrinfo(host,serv,&hints,&ainfo))!=0){
@@ -265,11 +272,15 @@ static void init_connect_list(){
 /// @brief 测试单个连接
 static void test_connect_unit(const connect_unit *unit){
 	printf("connect %s:%s",unit->host.c_str(),unit->serv.c_str());
-	int err=connect_nonb(unit->sockfd,(struct sockaddr*)&(unit->addr),unit->addrlen,g_timeout);
+	struct timeval timer=g_timeout;
+	int err=connect_nonb(unit->sockfd,(struct sockaddr*)&(unit->addr),unit->addrlen,timer);
 	if(err)
 		printf("  %s\n",strerror(-err));
-	else
-		printf("  ok\n");
+	else{
+		struct timeval sub;
+		timersub(&g_timeout,&timer,&sub);
+		printf("  ok(%lds %ldus)\n",sub.tv_sec,sub.tv_usec);
+	}
 }
 
 int main(int argc,char **argv){
