@@ -11,13 +11,18 @@
 #include <netdb.h>
 #include <string.h>
 #include <getopt.h>
+#include <stdarg.h>
+#include <syslog.h>
 
 #include <list>
 #include <algorithm>
 
 const char *g_host="127.0.0.1";
 const char *g_serv="22";
+int g_debug_level=LOG_ERR;   ///< 调试级别，仅输出大于等于该级别的日志
+
 struct timeval g_timeout={3,0};
+
 
 /// @brief 探测结构
 struct connect_unit{
@@ -37,6 +42,53 @@ static void clean_connect_list(std::list<connect_unit*> &ls){
 		delete *it;
 	}
 	ls.clear();
+}
+
+/// @brief 输出调试信息
+static void debug(int level,int err,const char *fmt,...){
+	if(level>g_debug_level)
+		return;
+	/// 输出错误信息
+	printf("%s: ",program_invocation_short_name);
+	va_list argp;
+	va_start(argp,fmt);
+	vprintf(fmt,argp);
+	va_end(argp);
+	if(err!=0)
+		printf(" :%s\n",strerror(err));
+	else
+		printf("\n");
+}
+
+static void debug_at_line(int level,int err,const char *file,
+		int line,const char *fmt,...){
+	if(level>g_debug_level)
+		return;
+	printf("%s: ",program_invocation_short_name);
+	printf("%s:%d ",file,line);
+	/// 输出错误信息
+	va_list argp;
+	va_start(argp,fmt);
+	vprintf(fmt,argp);
+	va_end(argp);
+	if(err!=0)
+		printf(" :%s\n",strerror(err));
+	else
+		printf("\n");
+}
+
+/// @brief 输出调试信息并退出
+static void debug_exit(int exit_code,int level,int err,const char *fmt,...){
+	if(level>g_debug_level)
+		exit(exit_code);
+	/// 输出错误信息
+	va_list argp;
+	va_start(argp,fmt);
+	vprintf(fmt,argp);
+	va_end(argp);
+	if(err!=0)
+		printf(" :%s\n",strerror(err));
+	exit(exit_code);
 }
 
 /// @brief 以tv为超时值建立tcp链接
@@ -114,7 +166,7 @@ static int sockaddr_to_string(const struct sockaddr *addr,socklen_t len,
 	char host[NI_MAXHOST],serv[NI_MAXSERV];
 	int err;
 	if((err=getnameinfo(addr,len,host,NI_MAXHOST,serv,NI_MAXSERV,NI_NUMERICHOST|NI_NUMERICSERV))!=0){
-		error_at_line(0,0,__FILE__,__LINE__,"getnameinfo error:",gai_strerror(err));
+		debug_at_line(LOG_WARNING,0,__FILE__,__LINE__,"getnameinfo :%s",gai_strerror(err));
 		return -EINVAL;
 	}
 	str_host=host;
@@ -137,7 +189,7 @@ static int append_connect_list_numeric(const char *host,const char *serv){
 	hints.ai_family=AF_UNSPEC;
 	int err=0;
 	if((err=getaddrinfo(host,serv,&hints,&info))!=0){
-		//error_at_line(0,0,__FILE__,__LINE__,"getaddrinfo error:%s",gai_strerror(err));
+		debug_at_line(LOG_WARNING,0,__FILE__,__LINE__,"getaddrinfo:%s",gai_strerror(err));
 		return -EINVAL;
 	}
 	// 转换为connect_unit
@@ -145,7 +197,7 @@ static int append_connect_list_numeric(const char *host,const char *serv){
 	for(;info!=NULL;info=info->ai_next){
 		int sockfd=socket(info->ai_family,info->ai_socktype,info->ai_protocol);
 		if(sockfd<0){
-			error_at_line(0,errno,__FILE__,__LINE__,"create socket error");
+			debug_at_line(LOG_WARNING,errno,__FILE__,__LINE__,"create socket,error");
 			continue;
 		}
 		struct connect_unit *unit=new connect_unit;
@@ -180,7 +232,7 @@ static int append_connect_list_domain(const char *host,const char *serv){
 	hints.ai_family=AF_UNSPEC;
 	int err=0;
 	if((err=getaddrinfo(host,serv,&hints,&ainfo))!=0){
-		error_at_line(0,0,__FILE__,__LINE__,"getaddrinfo error :%s",gai_strerror(err));
+		debug_at_line(LOG_WARNING,0,__FILE__,__LINE__,"getaddrinfo error:%s",gai_strerror(err));
 		return -EINVAL;
 	}
 	/// 解析connect_unit
@@ -188,7 +240,7 @@ static int append_connect_list_domain(const char *host,const char *serv){
 	for(;ainfo!=NULL;ainfo=ainfo->ai_next){
 		int sockfd=socket(ainfo->ai_family,ainfo->ai_socktype,ainfo->ai_protocol);
 		if(sockfd<0){
-			error_at_line(0,errno,__FILE__,__LINE__,"create socket error");
+			debug_at_line(LOG_WARNING,0,__FILE__,__LINE__,"ceate socket error");
 			continue;
 		}
 		struct connect_unit *unit=new connect_unit;
@@ -215,6 +267,7 @@ static void usage(int err){
 		printf("\n");
 		printf("选项:\n");
 		printf("  -s, --sec  测试时的超时值，单位为秒,默认值为3\n");
+		printf("  -d, --debug  level 调试级别\n");
 		printf("  -h, --help 显示改帮助信息\n");
 
 	}else{
@@ -223,16 +276,29 @@ static void usage(int err){
 	exit(err);
 }
 
+/// @brief 依据命令行参数设置调试等级
+static void parse_debug_level(const char *str){
+	if(NULL==str){
+		g_debug_level=LOG_INFO;
+		return;
+	}
+	long num=strtol(str,NULL,10);
+	if(num<0)
+		return;
+	g_debug_level+=num;
+}
+
 /// @brief 解析命令行参数
 static void parse_argument(int argc,char **argv){
 	const char *name=program_invocation_short_name;
 	struct option opts[]={
 		{"help",no_argument,NULL,'h'},
 		{"sec",required_argument,NULL,'s'},
+		{"debug",optional_argument,NULL,'d'},
 		{NULL,0,NULL,0},
 	};
 	int ch;
-	while((ch=getopt_long(argc,argv,":hs:",opts,NULL))!=-1){
+	while((ch=getopt_long(argc,argv,":hs:d::",opts,NULL))!=-1){
 		long sec;
 		switch(ch){
 			case 'h':
@@ -244,6 +310,9 @@ static void parse_argument(int argc,char **argv){
 					usage(EXIT_FAILURE);
 				}
 				g_timeout.tv_sec=sec;
+				break;
+			case 'd':
+				parse_debug_level(optarg);
 				break;
 			case '?':
 				fprintf(stderr,"%s:未识别选项: \'%c\'\n",name,optopt);
